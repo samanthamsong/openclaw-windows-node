@@ -68,7 +68,10 @@ public sealed class McpHttpServer : IDisposable
         _port = port;
         _listener = new HttpListener();
         // Loopback binding — not reachable from other machines.
+        // Register both numeric and hostname forms so clients that connect
+        // via http://localhost:port/ (common on Linux/macOS) are also served.
         _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+        _listener.Prefixes.Add($"http://localhost:{port}/");
     }
 
     public void Start()
