@@ -32,7 +32,9 @@ public sealed class SetupConfig
     public TraySettingsConfig Settings { get; set; } = new();
     public PairingConfig Pairing { get; set; } = new();
 
-    public string EffectiveGatewayUrl => GatewayUrl ?? $"ws://localhost:{GatewayPort}";
+    // Use 127.0.0.1 instead of "localhost" — .NET resolves localhost to IPv6 [::1]
+    // first, which WSL2 mirrored networking may not forward.
+    public string EffectiveGatewayUrl => GatewayUrl ?? $"ws://127.0.0.1:{GatewayPort}";
 
     public static SetupConfig LoadFromFile(string path)
     {

@@ -2996,7 +2996,8 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         {
             var psi = new System.Diagnostics.ProcessStartInfo(setupExePath)
             {
-                UseShellExecute = true
+                UseShellExecute = true,
+                Arguments = "--no-rollback-on-failure"
             };
             var process = System.Diagnostics.Process.Start(psi);
             if (process != null)

@@ -966,14 +966,18 @@ public sealed class StartGatewayStep : SetupStep
 
         if (!string.IsNullOrWhiteSpace(portCheck.Stdout) && portCheck.Stdout.Contains($":{ctx.Config.GatewayPort}"))
         {
-            if (!portCheck.Stdout.Contains("openclaw", StringComparison.OrdinalIgnoreCase))
+            // The gateway runs as "node … openclaw … gateway", so match either
+            // "openclaw" or "node" to avoid falsely flagging our own gateway process.
+            var isOwnGateway = portCheck.Stdout.Contains("openclaw", StringComparison.OrdinalIgnoreCase)
+                            || portCheck.Stdout.Contains("\"node\"", StringComparison.OrdinalIgnoreCase);
+            if (!isOwnGateway)
             {
                 ctx.Logger.Warn($"Port {ctx.Config.GatewayPort} is in use by another process:\n{portCheck.Stdout.Trim()}");
                 return StepResult.Fail(
                     $"Port {ctx.Config.GatewayPort} is already in use by another process. Either stop the conflicting process or change GatewayPort in the setup config.");
             }
 
-            ctx.Logger.Info($"Port {ctx.Config.GatewayPort} appears to be in use by openclaw — proceeding");
+            ctx.Logger.Info($"Port {ctx.Config.GatewayPort} appears to be in use by openclaw gateway — proceeding");
         }
 
         // Start the service
@@ -1016,8 +1020,21 @@ public sealed class StartGatewayStep : SetupStep
 
             if (status.ExitCode == 0 && status.Stdout.Trim() is "200" or "401" or "403")
             {
-                ctx.Logger.Info($"Gateway is accepting connections (HTTP {status.Stdout.Trim()})");
-                return StepResult.Ok("Gateway running");
+                ctx.Logger.Info($"Gateway is accepting connections from WSL (HTTP {status.Stdout.Trim()})");
+
+                // Verify the port is also reachable from Windows (WSL2 mirrored networking
+                // can delay port forwarding, causing downstream pairing steps to fail).
+                var windowsReachable = await WaitForWindowsPortReachable(
+                    ctx, ctx.Config.GatewayPort, healthDeadline, ct);
+
+                if (windowsReachable)
+                    return StepResult.Ok("Gateway running");
+
+                // WSL-side is healthy but Windows can't reach it — keep retrying
+                // the full loop in case the gateway restarts.
+                ctx.Logger.Warn("Gateway healthy in WSL but not yet reachable from Windows — retrying");
+                await Task.Delay(2000, ct);
+                continue;
             }
 
             ctx.Logger.Debug($"Gateway not yet accepting connections (curl exit={status.ExitCode}, response={status.Stdout.Trim()})");
@@ -1055,6 +1072,41 @@ public sealed class StartGatewayStep : SetupStep
             text,
             @"[0-9a-fA-F]{32,}",
             m => m.Value[..8] + "…[REDACTED]");
+    }
+
+    /// <summary>
+    /// Verify the gateway port is reachable from Windows (not just from inside WSL).
+    /// With WSL2 mirrored networking, port forwarding can lag behind the gateway
+    /// being healthy inside the VM.
+    /// </summary>
+    private static async Task<bool> WaitForWindowsPortReachable(
+        SetupContext ctx, int port, DateTimeOffset deadline, CancellationToken ct)
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        // Use 127.0.0.1 explicitly — .NET HttpClient resolves "localhost" to IPv6
+        // first, which may be blocked by Hyper-V firewall even when IPv4 is allowed.
+        var url = $"http://127.0.0.1:{port}/";
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                using var response = await http.GetAsync(url, ct);
+                var code = (int)response.StatusCode;
+                ctx.Logger.Info($"Gateway reachable from Windows (HTTP {code})");
+                return true;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                ctx.Logger.Debug($"Gateway not yet reachable from Windows: {ex.GetType().Name}");
+                await Task.Delay(2000, ct);
+            }
+        }
+
+        ctx.Logger.Error("Gateway is healthy in WSL but never became reachable from Windows. " +
+                         "Check WSL2 networking mode and Windows firewall rules.");
+        return false;
     }
 
     public override async Task RollbackAsync(SetupContext ctx, CancellationToken ct)
@@ -1239,7 +1291,8 @@ public sealed class PairOperatorStep : SetupStep
             // Phase 1: Initial connect (may get PAIRING_REQUIRED)
             client = new OpenClawGatewayClient(gatewayUrl, token, logger: wsLogger, identityPath: identityPath);
             client.UseV2Signature = true; // Local gateway uses v2 signature format
-            var phase1Result = await WaitForConnectionOrPairing(client, ctx, TimeSpan.FromSeconds(15), ct);
+            var pairingTimeout = TimeSpan.FromSeconds(ctx.Config.Pairing.TimeoutSeconds);
+            var phase1Result = await WaitForConnectionOrPairing(client, ctx, pairingTimeout, ct);
 
             if (phase1Result == ConnectionOutcome.Connected)
             {
@@ -1269,7 +1322,7 @@ public sealed class PairOperatorStep : SetupStep
                 // Phase 2: Reconnect — the device should now be approved
                 client = new OpenClawGatewayClient(gatewayUrl, token, logger: wsLogger, identityPath: identityPath);
                 client.UseV2Signature = true;
-                var phase2Result = await WaitForConnectionOrPairing(client, ctx, TimeSpan.FromSeconds(20), ct);
+                var phase2Result = await WaitForConnectionOrPairing(client, ctx, pairingTimeout, ct);
 
                 if (phase2Result == ConnectionOutcome.Connected)
                 {
@@ -1338,7 +1391,7 @@ public sealed class PairOperatorStep : SetupStep
 
         try
         {
-            var result = await WaitForConnectionOrPairing(finalClient, ctx, TimeSpan.FromSeconds(15), ct);
+            var result = await WaitForConnectionOrPairing(finalClient, ctx, TimeSpan.FromSeconds(ctx.Config.Pairing.TimeoutSeconds), ct);
 
             if (result == ConnectionOutcome.Connected)
             {
@@ -1364,7 +1417,7 @@ public sealed class PairOperatorStep : SetupStep
                 // One more connect to confirm
                 finalClient = new OpenClawGatewayClient(gatewayUrl, deviceToken, logger: wsLogger, identityPath: identityPath);
                 finalClient.UseV2Signature = true;
-                var finalResult = await WaitForConnectionOrPairing(finalClient, ctx, TimeSpan.FromSeconds(15), ct);
+                var finalResult = await WaitForConnectionOrPairing(finalClient, ctx, TimeSpan.FromSeconds(ctx.Config.Pairing.TimeoutSeconds), ct);
 
                 if (finalResult == ConnectionOutcome.Connected)
                 {
@@ -1450,16 +1503,17 @@ public sealed class PairOperatorStep : SetupStep
             ctx.Logger.Debug($"Operator connection status: {status}");
             if (status == ConnectionStatus.Connected)
                 tcs.TrySetResult(ConnectionOutcome.Connected);
-            else if (status == ConnectionStatus.Error)
-                tcs.TrySetResult(ConnectionOutcome.Error);
             else if (status == ConnectionStatus.Disconnected)
             {
                 // Check if pairing was required — client sets IsPairingRequired before disconnect
                 if (client.IsPairingRequired)
                     tcs.TrySetResult(ConnectionOutcome.PairingRequired);
-                else
-                    tcs.TrySetResult(ConnectionOutcome.Error);
+                // Don't resolve on non-pairing disconnect — let the client's
+                // internal auto-reconnect retry within the timeout window.
+                // On slow machines, WSL2 port forwarding may not be ready yet.
             }
+            // Don't resolve on Error — the client will auto-reconnect with backoff.
+            // The timeout will catch genuinely unreachable gateways.
         }
 
         client.StatusChanged += OnStatusChanged;
@@ -1575,7 +1629,7 @@ public sealed class PairOperatorStep : SetupStep
 
             if (string.IsNullOrWhiteSpace(token)) return;
 
-            var gatewayUrl = ctx.GatewayUrl ?? "ws://localhost:18789";
+            var gatewayUrl = ctx.GatewayUrl ?? $"ws://127.0.0.1:{ctx.Config.GatewayPort}";
             var httpBase = gatewayUrl
                 .Replace("ws://", "http://", StringComparison.OrdinalIgnoreCase)
                 .Replace("wss://", "https://", StringComparison.OrdinalIgnoreCase)
@@ -1622,7 +1676,7 @@ public sealed class PairNodeStep : SetupStep
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-            var resp = await http.GetAsync($"http://localhost:{ctx.Config.GatewayPort}/", ct);
+            var resp = await http.GetAsync($"http://127.0.0.1:{ctx.Config.GatewayPort}/", ct);
             ctx.Logger.Debug($"Gateway health check: HTTP {(int)resp.StatusCode}");
         }
         catch (Exception ex)
@@ -2133,7 +2187,7 @@ public sealed class VerifyEndToEndStep : SetupStep
 
         try
         {
-            var result = await PairOperatorStep.WaitForConnectionOrPairing(client, ctx, TimeSpan.FromSeconds(15), ct);
+            var result = await PairOperatorStep.WaitForConnectionOrPairing(client, ctx, TimeSpan.FromSeconds(ctx.Config.Pairing.TimeoutSeconds), ct);
 
             if (result == PairOperatorStep.ConnectionOutcome.Connected)
             {
@@ -2164,7 +2218,7 @@ public sealed class VerifyEndToEndStep : SetupStep
                 ctx.Logger.Info("Reconnecting with shared token to get fresh device token after approval");
                 client = new OpenClawGatewayClient(gatewayUrl, ctx.SharedGatewayToken!, logger: wsLogger, identityPath: identityPath);
                 client.UseV2Signature = true;
-                var confirmResult = await PairOperatorStep.WaitForConnectionOrPairing(client, ctx, TimeSpan.FromSeconds(15), ct);
+                var confirmResult = await PairOperatorStep.WaitForConnectionOrPairing(client, ctx, TimeSpan.FromSeconds(ctx.Config.Pairing.TimeoutSeconds), ct);
 
                 if (confirmResult == PairOperatorStep.ConnectionOutcome.Connected)
                 {
